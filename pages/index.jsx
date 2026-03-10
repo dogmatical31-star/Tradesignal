@@ -107,7 +107,7 @@ const PROXY = "https://api.allorigins.win/raw?url=";
 
 const fetchCandles = async (ticker) => {
   try {
-    const url = `https://query1.finance.yahoo.com/v8/finance/chart/${ticker}?interval=1h&range=10d`;
+    const url = `https://query1.finance.yahoo.com/v8/finance/chart/${ticker}?interval=1h&range=730d`;
     const res = await fetch(PROXY + encodeURIComponent(url));
     const data = await res.json();
     const r = data?.chart?.result?.[0];
@@ -127,7 +127,7 @@ const fetchCandles = async (ticker) => {
   }
 };
 
-const generateMockCandles = (ticker, count = 120) => {
+const generateMockCandles = (ticker, count = 500) => {
   let price = 100 + (ticker.charCodeAt(0) * 3.7) % 400;
   const trend = -0.002;
   return Array.from({ length: count }, (_, i) => {
