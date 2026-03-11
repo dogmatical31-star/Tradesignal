@@ -107,7 +107,7 @@ const PROXY = "https://api.allorigins.win/raw?url=";
 
 const fetchCandles = async (ticker) => {
   try {
-    const url = `https://query1.finance.yahoo.com/v8/finance/chart/${ticker}?interval=1h&range=730d`;
+    const url = `https://query1.finance.yahoo.com/v8/finance/chart/${ticker}?interval=1h&range=60d`;
     const res = await fetch(PROXY + encodeURIComponent(url));
     const data = await res.json();
     const r = data?.chart?.result?.[0];
@@ -146,11 +146,134 @@ const generateMockCandles = (ticker, count = 500) => {
   });
 };
 
+/* ── 스나이퍼 전략 지표 ── */
+const calcBB = (closes, p = 20, mult = 2) =>
+  closes.map((_, i) => {
+    if (i < p - 1) return { upper: null, lower: null };
+    const sl = closes.slice(i - p + 1, i + 1);
+    const mid = sl.reduce((a, b) => a + b, 0) / p;
+    const std = Math.sqrt(sl.reduce((a, b) => a + (b - mid) ** 2, 0) / p);
+    return { upper: mid + mult * std, lower: mid - mult * std, mid };
+  });
+
+const calcStoch = (candles, k = 14, d = 3) => {
+  const kArr = candles.map((_, i) => {
+    if (i < k - 1) return null;
+    const sl = candles.slice(i - k + 1, i + 1);
+    const hi = Math.max(...sl.map(c => c.high)), lo = Math.min(...sl.map(c => c.low));
+    return hi === lo ? 50 : (candles[i].close - lo) / (hi - lo) * 100;
+  });
+  const dArr = kArr.map((_, i) => {
+    const valid = kArr.slice(Math.max(0, i - d + 1), i + 1).filter(v => v != null);
+    return valid.length >= d ? valid.reduce((a, b) => a + b, 0) / valid.length : null;
+  });
+  return { k: kArr, d: dArr };
+};
+
+/* ── 분할 익절 포함 스나이퍼 백테스트 ── */
+const runSniperBacktest = (candles) => {
+  if (!candles || candles.length < 70) return null;
+  const closes = candles.map(c => c.close);
+  const rsi = calcRSI(closes);
+  const sma60 = calcSMA(closes, 60);
+  const sma20v = calcSMA(candles.map(c => c.volume), 20);
+  const bb = calcBB(closes);
+  const stoch = calcStoch(candles);
+  const trades = [];
+
+  for (let i = 65; i < candles.length - 5; i++) {
+    const r = rsi[i];
+    if (!r || r > 35) continue;
+
+    // 볼린저 하단 근접
+    if (!bb[i].lower || closes[i] > bb[i].lower * 1.03) continue;
+
+    // 3일 중 2일 60일선 ±4% 이내
+    if (!sma60[i]) continue;
+    let supDays = 0;
+    for (let d = 1; d <= 3; d++) {
+      if (i - d < 0 || !sma60[i - d]) continue;
+      const ratio = closes[i - d] / sma60[i - d];
+      if (ratio >= 0.96 && ratio <= 1.04) supDays++;
+    }
+    if (supDays < 2) continue;
+
+    // 거래량 1.5배
+    if (!sma20v[i] || candles[i].volume < sma20v[i] * 1.5) continue;
+
+    // 1% 이상 양봉 + 위꼬리 < 몸통 2배
+    const body = candles[i].close - candles[i].open;
+    const wick = candles[i].high - Math.max(candles[i].open, candles[i].close);
+    if (body / candles[i].open * 100 < 1.0 || wick > Math.abs(body) * 2) continue;
+
+    // 스토캐스틱 GC OR RSI 다이버전스
+    const stochGC = stoch.k[i-1] != null && stoch.d[i-1] != null &&
+                    stoch.k[i-1] < stoch.d[i-1] && stoch.k[i] > stoch.d[i];
+    const lows = [];
+    for (let j = Math.max(1, i - 40); j < i - 3; j++) {
+      if (candles[j].low < candles[j-1].low && candles[j].low < candles[j+1].low && rsi[j] != null)
+        lows.push({ price: candles[j].low, r: rsi[j] });
+    }
+    let rsiDiv = false;
+    if (lows.length >= 2) { const [a, b] = lows.slice(-2); rsiDiv = b.price < a.price && b.r > a.r + 1.5; }
+    if (!stochGC && !rsiDiv) continue;
+
+    // 분할 익절: 1부 +4%, 2부 RSI70 or BB상단
+    const entry = candles[i].close;
+    const stop = entry * 0.98;
+    const take1 = entry * 1.04;
+    let exit1 = null, exit2 = null, reason1 = "", reason2 = "";
+
+    for (let j = i + 1; j < Math.min(i + 30, candles.length); j++) {
+      // 손절 체크 (둘 다 동일)
+      if (candles[j].low <= stop) {
+        if (!exit1) { exit1 = stop; reason1 = "손절"; }
+        if (!exit2) { exit2 = stop; reason2 = "손절"; }
+        break;
+      }
+      // 1부 익절
+      if (!exit1 && candles[j].high >= take1) { exit1 = take1; reason1 = "익절(+4%)"; }
+      // 2부 익절: RSI70 or BB상단
+      if (exit1 && !exit2) {
+        if (rsi[j] != null && rsi[j] >= 70) { exit2 = candles[j].close; reason2 = "익절(RSI70)"; break; }
+        if (bb[j].upper && candles[j].high >= bb[j].upper) { exit2 = bb[j].upper; reason2 = "익절(BB상단)"; break; }
+        if (sma60[j] && candles[j].close < sma60[j] * 0.97) { exit2 = candles[j].close; reason2 = "손절(60일선)"; break; }
+      }
+    }
+    if (!exit1) { exit1 = candles[Math.min(i + 20, candles.length - 1)].close; reason1 = "시간"; }
+    if (!exit2) { exit2 = candles[Math.min(i + 25, candles.length - 1)].close; reason2 = "시간"; }
+
+    const pnl1 = (exit1 - entry) / entry * 100;
+    const pnl2 = (exit2 - entry) / entry * 100;
+    const pnlAvg = (pnl1 + pnl2) / 2;
+
+    trades.push({
+      bar: i, time: candles[i].time,
+      entry: entry.toFixed(2),
+      exit1: exit1.toFixed(2), exit2: exit2.toFixed(2),
+      pnl1: pnl1.toFixed(2), pnl2: pnl2.toFixed(2),
+      pnl: pnlAvg.toFixed(2),
+      reason: `1부 ${reason1} / 2부 ${reason2}`,
+    });
+    i += 5; // 중복 방지
+  }
+
+  if (!trades.length) return { trades, winRate: 0, avgPnl: 0, totalPnl: 0 };
+  const wins = trades.filter(t => parseFloat(t.pnl) > 0).length;
+  const totalPnl = trades.reduce((a, t) => a + parseFloat(t.pnl), 0);
+  return {
+    trades,
+    winRate: (wins / trades.length * 100).toFixed(1),
+    avgPnl: (totalPnl / trades.length).toFixed(2),
+    totalPnl: totalPnl.toFixed(2),
+  };
+};
+
 const runBacktest = (candles, holdBars = 6, stopPct = 0.02, takePct = 0.04) => {
   if (!candles || candles.length < 50) return null;
   const closes = candles.map(c => c.close);
   const trades = [];
-  for (let i = 30; i < candles.length - holdBars; i++) {
+  for (let i = 50; i < candles.length - holdBars; i++) {
     const slice = candles.slice(0, i + 1);
     const rsi = calcRSI(closes.slice(0, i + 1));
     const { hist } = calcMACD(closes.slice(0, i + 1));
@@ -323,6 +446,9 @@ export default function Home() {
   const [btResult, setBtResult] = useState(null);
   const [btLoading, setBtLoading] = useState(false);
   const [btTicker, setBtTicker] = useState("AAPL");
+  const [snResult, setSnResult] = useState(null);
+  const [snLoading, setSnLoading] = useState(false);
+  const [snTicker, setSnTicker] = useState("AAPL");
   const [slackWebhook, setSlackWebhook] = useState("");
   const [slackStatus, setSlackStatus] = useState("");
   const prevSignals = useRef({});
@@ -409,6 +535,13 @@ export default function Home() {
     setBtLoading(false);
   };
 
+  const runSN = async () => {
+    setSnLoading(true);
+    const { candles } = await fetchCandles(snTicker);
+    setSnResult(runSniperBacktest(candles));
+    setSnLoading(false);
+  };
+
   const selData = stocks[selected] || {};
   const alertCount = Object.values(stocks).filter(s => s?.cond1 || s?.cond2).length;
 
@@ -416,7 +549,10 @@ export default function Home() {
     { id: "dashboard", icon: "◉", label: "대시보드" },
     { id: "chart", icon: "↗", label: "차트" },
     { id: "backtest", icon: "◷", label: "백테스트" },
+    { id: "sniper", icon: "🎯", label: "스나이퍼" },
     { id: "history", icon: "☰", label: "히스토리" },
+    { id: "settings", icon: "⚙", label: "설정" },
+  ];
     { id: "settings", icon: "⚙", label: "설정" },
   ];
 
@@ -672,6 +808,81 @@ export default function Home() {
             </div>
           )}
 
+          {/* SNIPER */}
+          {tab === "sniper" && (
+            <div style={{ animation: "fadeUp 0.3s ease" }}>
+              {/* 전략 설명 */}
+              <div style={{ background: "#0a1929", border: "1px solid rgba(79,195,247,0.3)", borderRadius: 12, padding: 14, marginBottom: 14 }}>
+                <div style={{ fontSize: 12, fontWeight: 700, color: G.blue, marginBottom: 8, letterSpacing: "0.06em" }}>🎯 스나이퍼 전략</div>
+                <div style={{ fontSize: 10, color: G.muted, lineHeight: 1.8 }}>
+                  <span style={{ color: G.yellow }}>⚠ Yellow</span>: RSI 35↓ + 볼린저 하단 근접<br />
+                  <span style={{ color: "#ff9800" }}>🟠 Orange</span>: RSI 다이버전스 OR 스토캐스틱 GC<br />
+                  <span style={{ color: G.green }}>✅ Green</span>: 60일선 지지(3일 중 2일) + 거래량 1.5배 + 양봉 1%↑<br />
+                  <span style={{ color: G.muted }}>💰 분할 익절: 1부 +4% / 2부 RSI70 or BB상단</span>
+                </div>
+              </div>
+
+              {/* 종목 선택 + 실행 */}
+              <div style={{ background: G.panel, border: `1px solid ${G.border}`, borderRadius: 12, padding: 16, marginBottom: 14 }}>
+                <div style={{ fontSize: 13, fontWeight: 700, marginBottom: 12, letterSpacing: "0.06em" }}>백테스팅 (스나이퍼)</div>
+                <div style={{ display: "flex", gap: 6, flexWrap: "wrap", marginBottom: 12 }}>
+                  {tickers.map(t => (
+                    <button key={t} onClick={() => setSnTicker(t)} style={{ padding: "6px 12px", borderRadius: 8, fontSize: 12, fontWeight: 600, background: snTicker === t ? "rgba(79,195,247,0.15)" : G.dim, border: `1px solid ${snTicker === t ? "rgba(79,195,247,0.4)" : G.border}`, color: snTicker === t ? G.blue : G.muted }}>{t}</button>
+                  ))}
+                </div>
+                <button onClick={runSN} disabled={snLoading} style={{ width: "100%", padding: "12px", borderRadius: 8, background: snLoading ? G.dim : "rgba(79,195,247,0.15)", border: `1px solid ${snLoading ? G.border : "rgba(79,195,247,0.4)"}`, color: snLoading ? G.muted : G.blue, fontSize: 13, fontWeight: 700, letterSpacing: "0.08em" }}>
+                  {snLoading ? "⏳ 실행 중..." : "▶ 스나이퍼 백테스트 실행"}
+                </button>
+                <div style={{ fontSize: 10, color: G.muted, marginTop: 8, lineHeight: 1.7 }}>
+                  분할 익절: 1부 +4% 고정 / 2부 RSI70 or BB상단 · 손절: 60일선 -3%
+                </div>
+              </div>
+
+              {snResult && (
+                <>
+                  {/* 스탯 카드 */}
+                  <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10, marginBottom: 14 }}>
+                    {[
+                      { label: "총 거래", val: snResult.trades.length + "회" },
+                      { label: "승률", val: snResult.winRate + "%", col: parseFloat(snResult.winRate) >= 50 ? G.green : G.red },
+                      { label: "평균 수익(분할)", val: (parseFloat(snResult.avgPnl) >= 0 ? "+" : "") + snResult.avgPnl + "%", col: parseFloat(snResult.avgPnl) >= 0 ? G.green : G.red },
+                      { label: "누적 수익", val: (parseFloat(snResult.totalPnl) >= 0 ? "+" : "") + snResult.totalPnl + "%", col: parseFloat(snResult.totalPnl) >= 0 ? G.green : G.red },
+                    ].map(m => (
+                      <div key={m.label} style={{ background: G.panel, border: `1px solid ${G.border}`, borderRadius: 10, padding: "14px 16px" }}>
+                        <div style={{ fontSize: 10, color: G.muted, marginBottom: 6, letterSpacing: "0.06em" }}>{m.label}</div>
+                        <div style={{ fontSize: 22, fontWeight: 700, color: m.col || G.text }}>{m.val}</div>
+                      </div>
+                    ))}
+                  </div>
+
+                  {/* 거래 내역 */}
+                  <div style={{ background: G.panel, border: `1px solid ${G.border}`, borderRadius: 12, overflow: "hidden" }}>
+                    <div style={{ padding: "12px 16px", borderBottom: `1px solid ${G.border}`, fontSize: 11, fontWeight: 600, letterSpacing: "0.06em", color: G.muted }}>거래 내역 (분할 익절)</div>
+                    <div style={{ maxHeight: 360, overflowY: "auto" }}>
+                      {snResult.trades.length === 0 ? (
+                        <div style={{ padding: 32, textAlign: "center", color: G.muted, fontSize: 12 }}>해당 기간 신호 없음<br /><span style={{ fontSize: 10, marginTop: 6, display: "block" }}>조건이 까다로워 신호가 드물 수 있어요</span></div>
+                      ) : snResult.trades.map((t, i) => (
+                        <div key={i} style={{ padding: "10px 14px", borderBottom: `1px solid ${G.dim}` }}>
+                          <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 4 }}>
+                            <span style={{ fontSize: 10, color: G.muted }}>#{i + 1} {t.time}</span>
+                            <span style={{ fontWeight: 700, fontSize: 13, color: parseFloat(t.pnl) >= 0 ? G.green : G.red }}>
+                              {parseFloat(t.pnl) >= 0 ? "+" : ""}{t.pnl}%
+                            </span>
+                          </div>
+                          <div style={{ display: "flex", gap: 6, marginBottom: 4 }}>
+                            <span style={{ fontSize: 9, background: "rgba(0,230,118,0.1)", color: G.green, padding: "2px 7px", borderRadius: 4 }}>1부 {parseFloat(t.pnl1) >= 0 ? "+" : ""}{t.pnl1}%</span>
+                            <span style={{ fontSize: 9, background: "rgba(79,195,247,0.1)", color: G.blue, padding: "2px 7px", borderRadius: 4 }}>2부 {parseFloat(t.pnl2) >= 0 ? "+" : ""}{t.pnl2}%</span>
+                          </div>
+                          <div style={{ fontSize: 10, color: G.muted }}>진입 ${t.entry} · {t.reason}</div>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                </>
+              )}
+            </div>
+          )}
+
           {/* HISTORY */}
           {tab === "history" && (
             <div style={{ animation: "fadeUp 0.3s ease" }}>
@@ -753,7 +964,7 @@ export default function Home() {
         {/* Bottom Nav */}
         <div style={{ position: "fixed", bottom: 0, left: 0, right: 0, background: "rgba(13,17,23,0.97)", borderTop: `1px solid ${G.border}`, backdropFilter: "blur(10px)", display: "flex", paddingBottom: "env(safe-area-inset-bottom, 0px)", zIndex: 90 }}>
           {TABS.map(t => (
-            <button key={t.id} onClick={() => setTab(t.id)} style={{ flex: 1, padding: "10px 4px 8px", background: "none", border: "none", display: "flex", flexDirection: "column", alignItems: "center", gap: 3 }}>
+            <button key={t.id} onClick={() => setTab(t.id)} style={{ flex: 1, padding: "8px 2px 6px", background: "none", border: "none", display: "flex", flexDirection: "column", alignItems: "center", gap: 2 }}>
               <span style={{ fontSize: 16, color: tab === t.id ? G.green : G.muted, transition: "color 0.2s" }}>
                 {t.icon}
                 {t.id === "history" && history.length > 0 && (
