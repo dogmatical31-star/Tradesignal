@@ -553,8 +553,6 @@ export default function Home() {
     { id: "history", icon: "☰", label: "히스토리" },
     { id: "settings", icon: "⚙", label: "설정" },
   ];
-    { id: "settings", icon: "⚙", label: "설정" },
-  ];
 
   return (
     <>
