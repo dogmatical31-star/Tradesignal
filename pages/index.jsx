@@ -214,7 +214,7 @@ const runSniperBacktest = (candles) => {
   if (!candles || candles.length < 70) return null;
   const closes = candles.map(c => c.close);
   const rsi = calcRSI(closes);
-  const sma60 = calcSMA(closes, 60);   // 일봉 60일선
+  const sma60 = calcSMA(closes, 60);
   const sma20v = calcSMA(candles.map(c => c.volume), 20);
   const bb = calcBB(closes);
   const stoch = calcStoch(candles);
@@ -222,30 +222,24 @@ const runSniperBacktest = (candles) => {
 
   for (let i = 65; i < candles.length - 5; i++) {
     const r = rsi[i];
-    if (!r || r > 35) continue;
+    if (!r || r > 40) continue;               // RSI 40 이하 (완화)
 
-    // 볼린저 하단 근접 (일봉은 ±4%로 여유있게)
-    if (!bb[i].lower || closes[i] > bb[i].lower * 1.04) continue;
+    // 볼린저 하단 근접 (±6%로 완화)
+    if (!bb[i].lower || closes[i] > bb[i].lower * 1.06) continue;
 
-    // 3일 중 2일 60일선 ±5% 이내
+    // 60일선 ±8% 이내 (완화)
     if (!sma60[i]) continue;
-    let supDays = 0;
-    for (let d = 1; d <= 3; d++) {
-      if (i - d < 0 || !sma60[i - d]) continue;
-      const ratio = closes[i - d] / sma60[i - d];
-      if (ratio >= 0.95 && ratio <= 1.05) supDays++;
-    }
-    if (supDays < 2) continue;
+    const ratio = closes[i] / sma60[i];
+    if (ratio < 0.92 || ratio > 1.08) continue;
 
-    // 거래량 1.5배
-    if (!sma20v[i] || candles[i].volume < sma20v[i] * 1.5) continue;
+    // 거래량 1.2배 이상 (완화)
+    if (!sma20v[i] || candles[i].volume < sma20v[i] * 1.2) continue;
 
-    // 1% 이상 양봉 + 위꼬리 < 몸통 2배
+    // 0.5% 이상 양봉 (완화)
     const body = candles[i].close - candles[i].open;
-    const wick = candles[i].high - Math.max(candles[i].open, candles[i].close);
-    if (body / candles[i].open * 100 < 1.0 || wick > Math.abs(body) * 2) continue;
+    if (body / candles[i].open * 100 < 0.5) continue;
 
-    // 스토캐스틱 GC OR RSI 다이버전스
+    // 스토캐스틱 GC OR RSI 다이버전스 OR RSI 30 이하 단순 반등
     const stochGC = stoch.k[i-1] != null && stoch.d[i-1] != null &&
                     stoch.k[i-1] < stoch.d[i-1] && stoch.k[i] > stoch.d[i];
     const lows = [];
@@ -254,12 +248,13 @@ const runSniperBacktest = (candles) => {
         lows.push({ price: candles[j].low, r: rsi[j] });
     }
     let rsiDiv = false;
-    if (lows.length >= 2) { const [a, b] = lows.slice(-2); rsiDiv = b.price < a.price && b.r > a.r + 1.5; }
-    if (!stochGC && !rsiDiv) continue;
+    if (lows.length >= 2) { const [a, b] = lows.slice(-2); rsiDiv = b.price < a.price && b.r > a.r + 1; }
+    const rsiLow = r < 32; // RSI 32 이하면 조건 완화 허용
+    if (!stochGC && !rsiDiv && !rsiLow) continue;
 
-    // 분할 익절: 1부 +4%, 2부 RSI70 or BB상단 (일봉 최대 30일 보유)
+    // 분할 익절
     const entry = candles[i].close;
-    const stop = entry * 0.97; // 일봉은 손절 -3%
+    const stop = entry * 0.97;
     const take1 = entry * 1.04;
     let exit1 = null, exit2 = null, reason1 = "", reason2 = "";
 
@@ -281,14 +276,13 @@ const runSniperBacktest = (candles) => {
 
     const pnl1 = (exit1 - entry) / entry * 100;
     const pnl2 = (exit2 - entry) / entry * 100;
-    const pnlAvg = (pnl1 + pnl2) / 2;
 
     trades.push({
       bar: i, time: candles[i].time,
       entry: entry.toFixed(2),
       exit1: exit1.toFixed(2), exit2: exit2.toFixed(2),
       pnl1: pnl1.toFixed(2), pnl2: pnl2.toFixed(2),
-      pnl: pnlAvg.toFixed(2),
+      pnl: ((pnl1 + pnl2) / 2).toFixed(2),
       reason: `1부 ${reason1} / 2부 ${reason2}`,
     });
     i += 5;
